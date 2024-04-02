@@ -1,0 +1,389 @@
+---
+title: "B97F_breakpoint_analysis"
+author: "Gwonjin Lee"
+date: "`r Sys.Date()`"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+
+#F
+```{r}
+
+library(dplyr)
+library(tidyr)
+library(data.table)
+
+setwd("C:/Users/Gwonjin Lee/OneDrive - University of Florida/Project/Maize/GBS_analysis/linkage/B97")
+
+#Make a folder for plots
+if (!dir.exists("breakpoint")) {dir.create("breakpoint")}
+
+
+B97F_bp <- read.csv("B97F_eachbreakpoint.csv")
+
+B97F_map <- read.delim("B97F_mareyinput.txt", sep = "\t" )[,3:5]
+
+setDT(B97F_map)
+B97F_map[, mkr := sub("_.+", "", mkr)]
+
+
+head(B97F_map)
+head(B97F_bp)
+
+setDT(B97F_bp)
+
+
+# Function to find genetic position for a given breakpoint
+find_genetic_position <- function(chromosome, breakpoint, map_data) {
+  # Subset the map data for the given chromosome
+  chr_map <- map_data[chromosome == mkr]
+  
+  # Find the index of the first physical position larger than the breakpoint
+  idx <- which(chr_map$phys > breakpoint)[1]
+  
+  # If the breakpoint is before the first recorded position or after the last,
+  # we can't interpolate. Handling such cases depends on your specific needs.
+  # Here, returning NA for such cases.
+  if (is.na(idx) || idx == 1) {
+    return(NA_real_)
+  }
+  
+  # Physical positions surrounding the breakpoint
+  phys1 <- chr_map$phys[idx - 1]
+  phys2 <- chr_map$phys[idx]
+  
+  # Corresponding genetic positions
+  gen1 <- chr_map$gen[idx - 1]
+  gen2 <- chr_map$gen[idx]
+  
+  # Interpolate to find the genetic position
+  breakpoint_gen <- gen1 + ((breakpoint - phys1) / (phys2 - phys1)) * (gen2 - gen1) #interpolate mean
+  
+  return(breakpoint_gen)
+}
+
+# Add the new column to B97F_bp by applying the function
+B97F_bp[, breakpoint_gen := find_genetic_position(chromosome, breakpoint, B97F_map), by = .(genotype, chromosome, breakpoint)]
+
+# Check the result
+head(B97F_bp)
+
+# Add a sequence number within each group to differentiate the breakpoints
+B97F_bp <- B97F_bp %>%
+  group_by(genotype, chromosome) %>%
+  mutate(breakpoint_id = row_number()) %>%
+  ungroup() %>%
+  select(-breakpoint) # Remove 'breakpoint' column here
+
+
+
+B97F_bp_wide <- B97F_bp %>%
+  pivot_wider(
+    names_from = breakpoint_id,
+    names_prefix = "breakpoint",
+    values_from = breakpoint_gen,
+    names_expand = TRUE,
+    values_fill = list(breakpoint_gen = NA), # Fill missing values with NA
+    names_sort = TRUE # Ensure columns are sorted by breakpoint_id
+  )
+
+# Ensure that columns for breakpoint1 to breakpoint10 are present
+expected_cols <- paste0("breakpoint", 1:9)
+missing_cols <- setdiff(expected_cols, names(B97F_bp_wide))
+for (col in missing_cols) {
+  B97F_bp_wide[[col]] <- NA
+}
+
+# Arrange the columns in the desired order, if necessary
+# This assumes you want genotype and chromosome at the beginning, adjust as needed
+B97F_bp_wide <- B97F_bp_wide %>%
+  select(genotype, chromosome, sort(names(B97F_bp_wide)[!names(B97F_bp_wide) %in% c("genotype", "chromosome")]))
+
+
+# Calculate the maximum genetic position (chr size in cM) for each chromosome
+chromosome_sizes <- B97F_map %>%
+  dplyr::group_by(mkr) %>%
+  dplyr::summarise(size = max(gen, na.rm = TRUE), .groups = 'drop') # Explicitly drop grouping
+
+chromosome_sizes <- as.data.frame(chromosome_sizes)
+colnames(chromosome_sizes)[1] <- "chromosome"
+chromosome_sizes <- chromosome_sizes %>%
+  mutate(chromosome_num = as.numeric(gsub("chr", "", chromosome))) %>%
+  arrange(chromosome_num) %>%
+  select(-chromosome_num)
+
+# Create a data frame with all possible combinations of genotypes and chromosomes
+all_combinations <- expand.grid(
+  genotype = unique(B97F_bp_wide$genotype),
+  chromosome = unique(chromosome_sizes$chromosome)
+)
+
+# Merge the existing data frame with all_combinations and fill missing values
+B97F_bp_wide_size <- left_join(all_combinations, B97F_bp_wide, by = c("genotype", "chromosome")) %>%
+  mutate_at(vars(starts_with("breakpoint")), ~ifelse(is.na(.), "NaN", .)) %>%
+  left_join(chromosome_sizes, by = "chromosome")
+
+
+
+# Sort by chromosome and then by genotype
+B97F_bp_wide_size_sorted <- B97F_bp_wide_size[order(B97F_bp_wide_size$chromosome, B97F_bp_wide_size$genotype), ]
+
+head(B97F_bp_wide_size_sorted)
+
+
+
+# Ensure the size column is numeric
+B97F_bp_wide_size_sorted$size <- as.numeric(B97F_bp_wide_size_sorted$size)
+
+# Convert breakpoint columns to numeric, handling non-numeric entries
+breakpoint_cols <- grep("^breakpoint", names(B97F_bp_wide_size_sorted), value = TRUE)
+B97F_bp_wide_size_sorted[breakpoint_cols] <- lapply(B97F_bp_wide_size_sorted[breakpoint_cols], function(x) as.numeric(as.character(x)))
+
+# Normalize the breakpoint values directly in their columns
+B97F_bp_wide_size_sorted[breakpoint_cols] <- lapply(B97F_bp_wide_size_sorted[breakpoint_cols], function(x) x / B97F_bp_wide_size_sorted$size)
+
+# Now all breakpoint values are normalized, set the 'size' column to 1
+B97F_bp_wide_size_sorted$size <- 1
+
+# If needed, here's how you check the structure to ensure changes are as expected
+head(B97F_bp_wide_size_sorted)
+
+
+
+B97F_bp_wide_size_converted <- B97F_bp_wide_size_sorted[,c(1,2,12, 3:11)] #check the column number
+
+
+# Remove the first two columns (genotype and chromosome)
+B97F_bp_wide_size_final <- B97F_bp_wide_size_converted[, -(1:2)]
+
+# Split by genotype
+chr_list <- split(B97F_bp_wide_size_final, B97F_bp_wide_size_converted$chromosome)
+
+
+# Function to convert NaN values to "NaN" strings within a dataframe
+convert_NaN_to_string <- function(df) {
+  df[] <- lapply(df, function(x) {
+    # Check if the column is numeric, if so, convert NaN to "NaN"
+    if(is.numeric(x)) {
+      x[is.nan(x)] <- "NaN"
+      return(x)
+    } else {
+      return(x)
+    }
+  })
+  return(df)
+}
+
+setwd("C:/Users/Gwonjin Lee/OneDrive - University of Florida/Project/Maize/GBS_analysis/linkage/B97/breakpoint")
+
+# Save each genotype-specific table, converting NaN to "NaN" just before saving
+for (genotype_name in names(chr_list)) {
+  genotype_table <- chr_list[[genotype_name]]
+  
+  # Convert NaN to "NaN" for this table
+  genotype_table <- convert_NaN_to_string(genotype_table)
+  
+  # Save the table with "NaN" as strings
+  write.table(genotype_table, file = paste0(genotype_name, "_B97F_breakp.csv"), sep = ",", row.names = FALSE, col.names = FALSE, quote = FALSE)
+}
+
+
+
+
+
+```
+
+
+#################
+
+
+#M
+```{r}
+
+library(dplyr)
+library(tidyr)
+library(data.table)
+
+setwd("C:/Users/Gwonjin Lee/OneDrive - University of Florida/Project/Maize/GBS_analysis/linkage/B97")
+
+#Make a folder for plots
+if (!dir.exists("breakpoint")) {dir.create("breakpoint")}
+
+
+B97M_bp <- read.csv("B97M_eachbreakpoint.csv")
+
+B97M_map <- read.delim("B97M_mareyinput.txt", sep = "\t" )[,3:5]
+
+setDT(B97M_map)
+B97M_map[, mkr := sub("_.+", "", mkr)]
+
+
+head(B97M_map)
+head(B97M_bp)
+
+setDT(B97M_bp)
+
+
+# Function to find genetic position for a given breakpoint
+find_genetic_position <- function(chromosome, breakpoint, map_data) {
+  # Subset the map data for the given chromosome
+  chr_map <- map_data[chromosome == mkr]
+  
+  # Find the index of the first physical position larger than the breakpoint
+  idx <- which(chr_map$phys > breakpoint)[1]
+  
+  # If the breakpoint is before the first recorded position or after the last,
+  # we can't interpolate. Handling such cases depends on your specific needs.
+  # Here, returning NA for such cases.
+  if (is.na(idx) || idx == 1) {
+    return(NA_real_)
+  }
+  
+  # Physical positions surrounding the breakpoint
+  phys1 <- chr_map$phys[idx - 1]
+  phys2 <- chr_map$phys[idx]
+  
+  # Corresponding genetic positions
+  gen1 <- chr_map$gen[idx - 1]
+  gen2 <- chr_map$gen[idx]
+  
+  # Interpolate to find the genetic position
+  breakpoint_gen <- gen1 + ((breakpoint - phys1) / (phys2 - phys1)) * (gen2 - gen1) #interpolate mean
+  
+  return(breakpoint_gen)
+}
+
+# Add the new column to B97M_bp by applying the function
+B97M_bp[, breakpoint_gen := find_genetic_position(chromosome, breakpoint, B97M_map), by = .(genotype, chromosome, breakpoint)]
+
+# Check the result
+head(B97M_bp)
+
+# Add a sequence number within each group to differentiate the breakpoints
+B97M_bp <- B97M_bp %>%
+  group_by(genotype, chromosome) %>%
+  mutate(breakpoint_id = row_number()) %>%
+  ungroup() %>%
+  select(-breakpoint) # Remove 'breakpoint' column here
+
+
+
+B97M_bp_wide <- B97M_bp %>%
+  pivot_wider(
+    names_from = breakpoint_id,
+    names_prefix = "breakpoint",
+    values_from = breakpoint_gen,
+    names_expand = TRUE,
+    values_fill = list(breakpoint_gen = NA), # Fill missing values with NA
+    names_sort = TRUE # Ensure columns are sorted by breakpoint_id
+  )
+
+# Ensure that columns for breakpoint1 to breakpoint10 are present
+expected_cols <- paste0("breakpoint", 1:9)
+missing_cols <- setdiff(expected_cols, names(B97M_bp_wide))
+for (col in missing_cols) {
+  B97M_bp_wide[[col]] <- NA
+}
+
+# Arrange the columns in the desired order, if necessary
+# This assumes you want genotype and chromosome at the beginning, adjust as needed
+B97M_bp_wide <- B97M_bp_wide %>%
+  select(genotype, chromosome, sort(names(B97M_bp_wide)[!names(B97M_bp_wide) %in% c("genotype", "chromosome")]))
+
+
+# Calculate the maximum genetic position (chr size in cM) for each chromosome
+chromosome_sizes <- B97M_map %>%
+  dplyr::group_by(mkr) %>%
+  dplyr::summarise(size = max(gen, na.rm = TRUE), .groups = 'drop') # Explicitly drop grouping
+
+chromosome_sizes <- as.data.frame(chromosome_sizes)
+colnames(chromosome_sizes)[1] <- "chromosome"
+chromosome_sizes <- chromosome_sizes %>%
+  mutate(chromosome_num = as.numeric(gsub("chr", "", chromosome))) %>%
+  arrange(chromosome_num) %>%
+  select(-chromosome_num)
+
+# Create a data frame with all possible combinations of genotypes and chromosomes
+all_combinations <- expand.grid(
+  genotype = unique(B97M_bp_wide$genotype),
+  chromosome = unique(chromosome_sizes$chromosome)
+)
+
+# Merge the existing data frame with all_combinations and fill missing values
+B97M_bp_wide_size <- left_join(all_combinations, B97M_bp_wide, by = c("genotype", "chromosome")) %>%
+  mutate_at(vars(starts_with("breakpoint")), ~ifelse(is.na(.), "NaN", .)) %>%
+  left_join(chromosome_sizes, by = "chromosome")
+
+
+
+# Sort by chromosome and then by genotype
+B97M_bp_wide_size_sorted <- B97M_bp_wide_size[order(B97M_bp_wide_size$chromosome, B97M_bp_wide_size$genotype), ]
+
+head(B97M_bp_wide_size_sorted)
+
+
+
+# Ensure the size column is numeric
+B97M_bp_wide_size_sorted$size <- as.numeric(B97M_bp_wide_size_sorted$size)
+
+# Convert breakpoint columns to numeric, handling non-numeric entries
+breakpoint_cols <- grep("^breakpoint", names(B97M_bp_wide_size_sorted), value = TRUE)
+B97M_bp_wide_size_sorted[breakpoint_cols] <- lapply(B97M_bp_wide_size_sorted[breakpoint_cols], function(x) as.numeric(as.character(x)))
+
+# Normalize the breakpoint values directly in their columns
+B97M_bp_wide_size_sorted[breakpoint_cols] <- lapply(B97M_bp_wide_size_sorted[breakpoint_cols], function(x) x / B97M_bp_wide_size_sorted$size)
+
+# Now all breakpoint values are normalized, set the 'size' column to 1
+B97M_bp_wide_size_sorted$size <- 1
+
+# If needed, here's how you check the structure to ensure changes are as expected
+head(B97M_bp_wide_size_sorted)
+
+
+
+B97M_bp_wide_size_converted <- B97M_bp_wide_size_sorted[,c(1,2,12, 3:11)] #check the column number
+
+
+# Remove the first two columns (genotype and chromosome)
+B97M_bp_wide_size_final <- B97M_bp_wide_size_converted[, -(1:2)]
+
+# Split by genotype
+chr_list <- split(B97M_bp_wide_size_final, B97M_bp_wide_size_converted$chromosome)
+
+
+# Function to convert NaN values to "NaN" strings within a dataframe
+convert_NaN_to_string <- function(df) {
+  df[] <- lapply(df, function(x) {
+    # Check if the column is numeric, if so, convert NaN to "NaN"
+    if(is.numeric(x)) {
+      x[is.nan(x)] <- "NaN"
+      return(x)
+    } else {
+      return(x)
+    }
+  })
+  return(df)
+}
+
+setwd("C:/Users/Gwonjin Lee/OneDrive - University of Florida/Project/Maize/GBS_analysis/linkage/B97/breakpoint")
+
+# Save each genotype-specific table, converting NaN to "NaN" just before saving
+for (genotype_name in names(chr_list)) {
+  genotype_table <- chr_list[[genotype_name]]
+  
+  # Convert NaN to "NaN" for this table
+  genotype_table <- convert_NaN_to_string(genotype_table)
+  
+  # Save the table with "NaN" as strings
+  write.table(genotype_table, file = paste0(genotype_name, "_B97M_breakp.csv"), sep = ",", row.names = FALSE, col.names = FALSE, quote = FALSE)
+}
+
+
+
+
+
+```
+
+
