@@ -1,0 +1,4 @@
+*.bash linguist-detectable=true
+*.Rmd linguist-detectable=true
+*.R linguist-detectable=true
+*.py linguist-detectable=true
